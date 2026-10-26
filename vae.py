@@ -9,6 +9,9 @@
 没有使用 BatchNorm、学习率调度、混合精度、beta-VAE、数据增强等技巧。
 目的先把 VAE 跑通，看清楚每一层在做什么。
 
+按 Figure 22 的结构实现后，参数量是 4,348,547，和论文 Table 1 里的 VAE
+参数数量完全一致。
+
 数据：
     data/car_racing_frames_1000.npz
     data_gen.py 保存的是原始 96x96 图片，底部 12 行是 HUD。
@@ -197,17 +200,17 @@ class Decoder(nn.Module):
     def __init__(self, latent_dim=LATENT_DIM):
         super().__init__()
 
-        # 先把 z 映射回 2x2x256，再逐步反卷积放大
-        self.fc = nn.Linear(in_features=latent_dim, out_features=2 * 2 * 256)
+        # 论文 Figure 22 里，z 先经过一个 dense 层变成 1x1x1024，
+        # 然后第一个反卷积用 1024 个输入通道、kernel=5、stride=1，
+        # 得到 5x5x128。
+        self.fc = nn.Linear(in_features=latent_dim, out_features=1024)
 
-        # 尺寸变化：2 -> 5 -> 13 -> 30 -> 64
-        # 第一层用 padding=1，是为了严格对齐论文 Figure 22 里的 5x5。
+        # 尺寸变化：1 -> 5 -> 13 -> 30 -> 64
         self.deconv1 = nn.ConvTranspose2d(
-            in_channels=256,
+            in_channels=1024,
             out_channels=128,
             kernel_size=5,
-            stride=2,
-            padding=1,
+            stride=1,
         )
         self.deconv2 = nn.ConvTranspose2d(
             in_channels=128,
@@ -231,7 +234,7 @@ class Decoder(nn.Module):
     def forward(self, z):
         # z: (batch, latent_dim)
         x = F.relu(self.fc(z))                  # (batch, 1024)
-        x = x.reshape(x.size(0), 256, 2, 2)     # (batch, 256, 2, 2)
+        x = x.reshape(x.size(0), 1024, 1, 1)    # (batch, 1024, 1, 1)
 
         x = F.relu(self.deconv1(x))             # (batch, 128, 5, 5)
         x = F.relu(self.deconv2(x))             # (batch, 64, 13, 13)
