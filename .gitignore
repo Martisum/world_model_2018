@@ -1,0 +1,9 @@
+# 生成的数据（随时可以用 data_gen.py 重新生成）
+data/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# Ruff 缓存
+.ruff_cache/
