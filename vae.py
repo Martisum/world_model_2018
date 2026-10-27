@@ -13,7 +13,8 @@
 参数数量完全一致。
 
 数据：
-    data/car_racing_frames_1000.npz
+    data/car_racing_frames_10000.npz（优先）
+    data/car_racing_frames_1000.npz（没有 10000 张时使用）
     data_gen.py 保存的是原始 96x96 图片，底部 12 行是 HUD。
     这里在读取时裁掉 HUD，并 resize 到论文使用的 64x64：
         image[0:84, 6:90, :]  -> 84x84  （去掉底部 12 行，左右各裁 6 像素）
@@ -32,6 +33,12 @@
 
     # 只看看数据能不能读、模型能不能跑
     python vae.py --epochs 1
+
+    python vae.py --data data/car_racing_frames_10000.npz --epochs 30
+
+    # 想减轻模糊，可以试试 L1 重建 + 小一点的 beta + 余弦调度
+    python vae.py --data data/car_racing_frames_10000.npz --epochs 30 \
+        --recon-loss l1 --beta 0.5 --scheduler cosine
 
 输出：
     data/vae_carracing.pth         模型参数
@@ -54,17 +61,44 @@ LATENT_DIM = 32
 IMAGE_SIZE = 64
 
 
+def default_data_path():
+    """优先使用 10000 张的数据；没有就退回 1000 张。"""
+    data_10k = PROJECT_DIR / "data" / "car_racing_frames_10000.npz"
+    data_1k = PROJECT_DIR / "data" / "car_racing_frames_1000.npz"
+    if data_10k.exists():
+        return data_10k
+    return data_1k
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="在 CarRacing 图片上训练一个基础 VAE")
     parser.add_argument(
         "--data",
         type=str,
-        default=str(PROJECT_DIR / "data" / "car_racing_frames_1000.npz"),
-        help="data_gen.py 生成的 npz 文件",
+        default=str(default_data_path()),
+        help="data_gen.py 生成的 npz 文件（默认优先 10000 张，其次 1000 张）",
     )
     parser.add_argument("--epochs", type=int, default=20, help="训练轮数")
     parser.add_argument("--batch-size", type=int, default=64, help="每个 batch 的图片数")
     parser.add_argument("--lr", type=float, default=0.001, help="Adam 学习率")
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=1.0,
+        help="KL 损失的权重；小于 1 会减轻 KL 压力，重建通常更清晰",
+    )
+    parser.add_argument(
+        "--recon-loss",
+        choices=["mse", "l1"],
+        default="mse",
+        help="重建损失：mse 对应论文的 L2，l1 通常更锐利",
+    )
+    parser.add_argument(
+        "--scheduler",
+        choices=["none", "cosine"],
+        default="none",
+        help="学习率调度：none 或 cosine",
+    )
     parser.add_argument("--latent-dim", type=int, default=LATENT_DIM, help="latent z 的维度")
     parser.add_argument("--seed", type=int, default=0, help="随机种子")
     parser.add_argument("--save-every", type=int, default=5, help="每多少轮保存一次重建图")
@@ -88,6 +122,8 @@ def parse_args():
         parser.error("--batch-size 必须大于 0")
     if args.lr <= 0:
         parser.error("--lr 必须大于 0")
+    if args.beta < 0:
+        parser.error("--beta 不能是负数")
     if args.latent_dim <= 0:
         parser.error("--latent-dim 必须大于 0")
     if args.save_every <= 0:
@@ -169,6 +205,13 @@ class Encoder(nn.Module):
     def __init__(self, latent_dim=LATENT_DIM):
         super().__init__()
 
+        # 这里用卷积而不是 flatten + Linear，原因是：
+        #   1. 图像的空间结构很重要，卷积的局部感受野适合找边缘、弯道；
+        #   2. 同一个卷积核在所有位置共享，参数少很多；
+        #   3. 反向传播由 PyTorch autograd 自动完成，不需要手推卷积的梯度。
+        # 如果改成 Linear，64x64x3 = 12288 维直接连到 1024 维，
+        # 光这一层就有 1200 多万个参数，而且会丢掉像素之间的位置关系。
+        #
         # 每一层都使用 kernel=4, stride=2，所以尺寸大约减半：
         # 64 -> 31 -> 14 -> 6 -> 2
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=32, kernel_size=4, stride=2)
@@ -257,10 +300,31 @@ class VAE(nn.Module):
         return self.encoder(x)
 
     def reparameterize(self, mu, logvar):
-        """从 N(mu, exp(logvar)) 里采样一个 z。"""
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+        """从 N(mu, exp(logvar)) 里采样一个 z。
+
+        参数：
+            mu     : (B, latent_dim)，高斯均值
+            logvar : (B, latent_dim)，高斯对数方差 log(σ²)
+
+        返回：
+            z      : (B, latent_dim)
+
+        两行关键代码：
+            std = torch.exp(0.5 * logvar)
+                输入 log(σ²)，输出 σ = exp(0.5 * log(σ²))，形状不变。
+                这一步只是算标准差，不是采样。
+
+            eps = torch.randn_like(std)
+                输入 std，只借用它的形状 / dtype / device；
+                输出同形状的标准正态噪声 ε ~ N(0, 1)。
+                “随机采样”是这一行完成的。
+
+            z = mu + eps * std
+                等价于 z ~ N(mu, σ²)，而且梯度可以正常回传到 mu 和 std。
+        """
+        std = torch.exp(0.5 * logvar)   # σ = exp(0.5 · log σ²)，不是采样
+        eps = torch.randn_like(std)     # 真正的采样：ε ~ N(0, 1)
+        return mu + eps * std           # z = μ + σ⊙ε
 
     def forward(self, x):
         mu, logvar = self.encode(x)
@@ -269,18 +333,27 @@ class VAE(nn.Module):
         return recon, mu, logvar
 
 
-def vae_loss(recon, x, mu, logvar):
+def vae_loss(recon, x, mu, logvar, beta=1.0, recon_loss_type="mse"):
     """返回 (总损失, 重建损失, KL 损失)，都是每个样本的平均值。
 
-    重建损失：每个像素的平方误差，先对一张图的所有像素求和，再对 batch 平均。
+    重建损失：每个像素的误差，先对一张图的所有像素求和，再对 batch 平均。
+        recon_loss_type="mse" 对应论文的 L2；
+        recon_loss_type="l1" 往往能得到更锐利的边缘。
     KL 损失：KL(N(mu, sigma^2) || N(0, 1)) 的标准闭式解。
+    beta：KL 项的权重。beta=1 是普通 VAE；beta<1 会减轻 KL 压力。
     """
     batch_size = x.size(0)
 
-    recon_loss = F.mse_loss(recon, x, reduction="sum") / batch_size
+    if recon_loss_type == "mse":
+        recon_loss = F.mse_loss(recon, x, reduction="sum") / batch_size
+    elif recon_loss_type == "l1":
+        recon_loss = F.l1_loss(recon, x, reduction="sum") / batch_size
+    else:
+        raise ValueError(f"未知重建损失：{recon_loss_type}")
+
     kl_loss = -0.5 * torch.sum(1 + logvar - mu ** 2 - logvar.exp()) / batch_size
 
-    total_loss = recon_loss + kl_loss
+    total_loss = recon_loss + beta * kl_loss
     return total_loss, recon_loss, kl_loss
 
 
@@ -295,6 +368,9 @@ def tensor_to_image(tensor):
 
 def save_reconstructions(model, images, device, path, n=8):
     """保存上排原图、下排重建图的对比图。"""
+    # 切换到评估模式：关闭 Dropout / BatchNorm 的训练行为。
+    # 我们这个 VAE 没有这两类层，所以数值上没差别，但和 torch.no_grad()
+    # 一起用是评估/推理时的标准写法。
     model.eval()
 
     # 从数据集里均匀取 n 张，避免每次都看同样位置的图
@@ -350,9 +426,19 @@ def train(args):
     num_params = sum(p.numel() for p in model.parameters())
     print(f"latent z : {args.latent_dim} 维")
     print(f"参数量   : {num_params:,}")
+    print(f"重建损失 : {args.recon_loss}")
+    print(f"beta     : {args.beta}")
+    print(f"调度器   : {args.scheduler}")
     print()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    scheduler = None
+    if args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+        )
 
     checkpoint_path = resolve_path(args.checkpoint)
     recon_path = resolve_path(args.recon)
@@ -360,6 +446,8 @@ def train(args):
     recon_path.parent.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(args.epochs):
+        # model.train() 只负责切换模式，不接收数据，也不做前向/反向传播。
+        # 真正的训练发生在下面的 loss.backward() 和 optimizer.step()。
         model.train()
 
         total_loss = 0.0
@@ -372,7 +460,14 @@ def train(args):
             optimizer.zero_grad()
 
             recon, mu, logvar = model(x)
-            loss, recon_loss, kl_loss = vae_loss(recon, x, mu, logvar)
+            loss, recon_loss, kl_loss = vae_loss(
+                recon,
+                x,
+                mu,
+                logvar,
+                beta=args.beta,
+                recon_loss_type=args.recon_loss,
+            )
 
             loss.backward()
             optimizer.step()
@@ -393,6 +488,9 @@ def train(args):
             f"recon={avg_recon:9.3f} | "
             f"kl={avg_kl:7.3f}"
         )
+
+        if scheduler is not None:
+            scheduler.step()
 
         if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
             save_reconstructions(model, images, device, recon_path)
