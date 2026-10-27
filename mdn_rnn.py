@@ -173,7 +173,11 @@ def build_sequences(z, seeds, steps, seq_len):
 
 
 class SequenceDataset(Dataset):
-    """输入 z_0..z_{T-1}，目标是 z_1..z_T。"""
+    """输入 z_0..z_{T-1}，目标是 z_1..z_T。
+
+    一个样本是一个完整的窗口；DataLoader 的 shuffle 打乱的是“窗口”这个样本，
+    不会打乱窗口内部的时间顺序。
+    """
 
     def __init__(self, sequences):
         self.sequences = sequences
@@ -216,6 +220,9 @@ class MDNRNN(nn.Module):
 
     def forward(self, z_sequence, hidden=None):
         # z_sequence: (B, T, D)
+        #   B = 一次并行处理的序列条数（batch）
+        #   T = 每条序列的时间步数（sequence length）
+        #   D = latent z 的维度
         lstm_out, hidden = self.lstm(z_sequence, hidden)  # (B, T, H)
         params = self.fc(lstm_out)                        # (B, T, K*(1+2D))
 
@@ -368,7 +375,7 @@ def train(args):
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=True,  # 打乱的是序列窗口，不会打乱窗口内部的 T 个时间步
         num_workers=0,
     )
 
