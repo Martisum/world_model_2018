@@ -1,4 +1,8 @@
-"""生成 CarRacing 的 VAE 训练图片。
+"""生成 CarRacing 的 VAE 训练图片（只给 VAE 用，不用于 MDN-RNN）。
+
+这份数据是“稀疏采样”：每隔 --gap 步保存一张，画面更分散、更多样，
+适合逐帧训练 VAE。MDN-RNN 需要连续帧和每一步的动作，请用
+data_gen_rnn.py 单独采集。
 
 做这件事的原因：
     VAE 要学会重建赛车画面，所以训练集里必须有足够多的赛道、弯道和车身姿态。
@@ -13,15 +17,15 @@
 
 输出：
     data/raw_frames/0000_seed0000_step0080.png ...   （原始 96x96 图片）
-    data/car_racing_frames_1000.npz                  （打包后的数组，方便读取）
+    data/car_racing_frames_<num_images>.npz           （打包后的数组，方便读取）
 
 重复运行会先清空 data/raw_frames/，并删除旧的 data/car_racing_frames_*.npz，
 所以可以放心重跑。
 
 加载方式：
     import numpy as np
-    data = np.load("data/car_racing_frames_1000.npz")
-    images = data["images"]      # (1000, 96, 96, 3), uint8, 0..255
+    data = np.load("data/car_racing_frames_10000.npz")
+    images = data["images"]      # (10000, 96, 96, 3), uint8, 0..255
     seeds = data["seeds"]
     steps = data["steps"]
 

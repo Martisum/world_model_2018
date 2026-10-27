@@ -15,7 +15,7 @@
 数据：
     data/car_racing_frames_10000.npz（优先）
     data/car_racing_frames_1000.npz（没有 10000 张时使用）
-    data_gen.py 保存的是原始 96x96 图片，底部 12 行是 HUD。
+    data_gen_vae.py 保存的是原始 96x96 图片，底部 12 行是 HUD。
     这里在读取时裁掉 HUD，并 resize 到论文使用的 64x64：
         image[0:84, 6:90, :]  -> 84x84  （去掉底部 12 行，左右各裁 6 像素）
         resize 到 64x64
@@ -76,7 +76,7 @@ def parse_args():
         "--data",
         type=str,
         default=str(default_data_path()),
-        help="data_gen.py 生成的 npz 文件（默认优先 10000 张，其次 1000 张）",
+        help="data_gen_vae.py 生成的 npz 文件（默认优先 10000 张，其次 1000 张）",
     )
     parser.add_argument("--epochs", type=int, default=20, help="训练轮数")
     parser.add_argument("--batch-size", type=int, default=64, help="每个 batch 的图片数")
@@ -159,7 +159,7 @@ def load_images(npz_path, image_size=IMAGE_SIZE):
     if not npz_path.exists():
         raise FileNotFoundError(
             f"找不到数据文件：{npz_path}\n"
-            "请先运行：python data_gen.py"
+            "请先运行：python data_gen_vae.py"
         )
 
     with np.load(npz_path) as data:

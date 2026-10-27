@@ -1,21 +1,19 @@
 """基础 MDN-RNN：在 VAE 的 latent 空间里预测下一帧。
 
-流程：
+数据来自 data_gen_rnn.py：
+    images / actions / rewards / dones / episode_ids / steps / seeds
+
+每一局是连续帧，每一步都有真实动作 a_t。流程：
     1. 用训练好的 VAE 编码器把图片编码成 z（这里取 mu，不采样）；
-    2. 把 z 序列按时间切成 (z_t, z_{t+1})；
-    3. LSTM 读入 z_t，输出混合高斯分布 P(z_{t+1} | z_t, h_t)；
+    2. 把 z 序列和动作序列按时间切成窗口；
+    3. LSTM 读入 [z_t, a_t]，输出混合高斯分布 P(z_{t+1} | a_t, z_t, h_t)；
     4. 取混合高斯的均值作为预测的 z_{t+1}；
     5. 把预测的 z 交给 VAE 解码器，得到预测图像。
 
 这是一个“基础版”：
-    - 没有把动作 a_t 拼进输入。论文里是 P(z_{t+1} | a_t, z_t, h_t)，
-      当前数据文件里也没有保存动作，所以先只用 z_t。
+    - 输入是 [z_t, a_t]，和论文的 P(z_{t+1} | a_t, z_t, h_t) 对齐；
+    - 没有预测 done / reward；
     - 没有做多步自回归 rollout，只做 teacher forcing 的下一步预测。
-
-数据注意：
-    当前 data/car_racing_frames_10000.npz 是每 20 个环境步保存一帧。
-    所以这里预测的是“20 个环境步之后”的 z，不是严格的下一帧。
-    要严格预测下一帧，需要重新用 --gap 1 采集连续帧数据。
 
 运行：
     conda activate world_model
@@ -55,8 +53,8 @@ def parse_args():
     parser.add_argument(
         "--data",
         type=str,
-        default=str(PROJECT_DIR / "data" / "car_racing_frames_10000.npz"),
-        help="包含图片序列的 npz 文件",
+        default=str(PROJECT_DIR / "data" / "rnn_sequences.npz"),
+        help="data_gen_rnn.py 生成的连续序列数据",
     )
     parser.add_argument(
         "--vae-checkpoint",
@@ -127,7 +125,7 @@ def encode_images(vae, images, device, batch_size=128):
     """把 (N,64,64,3) 的 uint8 图片编码成 (N,32) 的 z。
 
     这里直接取编码器的 mu，不做采样。对 MDN-RNN 来说，
-    用确定性的 mu 作为序列输入更稳定；论文训练时也可以这样处理。
+    用确定性的 mu 作为序列输入更稳定。
     """
     vae.eval()
     all_z = []
@@ -146,70 +144,89 @@ def encode_images(vae, images, device, batch_size=128):
     return z
 
 
-def build_sequences(z, seeds, steps, seq_len):
-    """按 seed 分组，切成 (seq_len + 1) 步的窗口。
+def build_sequences(z, actions, episode_ids, steps, seq_len):
+    """按 episode 分组，切成 (seq_len + 1) 帧的窗口。
 
     返回：
-        sequences        : (S, seq_len+1, 32)
-        index_sequences  : (S, seq_len+1)，每条序列对应的原始图片下标
+        z_sequences      : (S, seq_len+1, 32)
+        action_sequences : (S, seq_len, 3)  只取输入步的动作
+        index_sequences  : (S, seq_len+1)   对应的原始图片下标
     """
-    sequences = []
+    z_sequences = []
+    action_sequences = []
     index_sequences = []
 
-    for seed in np.unique(seeds):
-        indices = np.where(seeds == seed)[0]
+    for episode_id in np.unique(episode_ids):
+        indices = np.where(episode_ids == episode_id)[0]
         indices = indices[np.argsort(steps[indices])]
 
         # 窗口不重叠，步长就是 seq_len
         for start in range(0, len(indices) - seq_len, seq_len):
             window = indices[start:start + seq_len + 1]
-            sequences.append(z[window])
+            z_sequences.append(z[window])
+            action_sequences.append(actions[window[:-1]])
             index_sequences.append(window)
 
-    if len(sequences) == 0:
+    if len(z_sequences) == 0:
         raise ValueError("没有足够的连续帧，无法构造序列；请减小 --seq-len")
 
-    return np.stack(sequences), np.stack(index_sequences)
+    return (
+        np.stack(z_sequences),
+        np.stack(action_sequences),
+        np.stack(index_sequences),
+    )
 
 
 class SequenceDataset(Dataset):
-    """输入 z_0..z_{T-1}，目标是 z_1..z_T。
+    """一个样本 = 一个窗口；DataLoader 的 shuffle 只打乱窗口顺序。
 
-    一个样本是一个完整的窗口；DataLoader 的 shuffle 打乱的是“窗口”这个样本，
-    不会打乱窗口内部的时间顺序。
+    输入：
+        z_t      (seq_len, 32)
+        a_t      (seq_len, 3)
+    目标：
+        z_{t+1}  (seq_len, 32)
     """
 
-    def __init__(self, sequences):
-        self.sequences = sequences
+    def __init__(self, z_sequences, action_sequences):
+        self.z_sequences = z_sequences
+        self.action_sequences = action_sequences
 
     def __len__(self):
-        return len(self.sequences)
+        return len(self.z_sequences)
 
     def __getitem__(self, index):
-        sequence = self.sequences[index]  # (T+1, 32)
-        inputs = sequence[:-1]
-        targets = sequence[1:]
-        return torch.from_numpy(inputs), torch.from_numpy(targets)
+        z_sequence = self.z_sequences[index]       # (T+1, 32)
+        action_sequence = self.action_sequences[index]  # (T, 3)
+
+        input_z = z_sequence[:-1]                  # (T, 32)
+        target_z = z_sequence[1:]                  # (T, 32)
+
+        return (
+            torch.from_numpy(input_z),
+            torch.from_numpy(action_sequence),
+            torch.from_numpy(target_z),
+        )
 
 
 class MDNRNN(nn.Module):
     """LSTM + 混合高斯输出头。
 
-    LSTM 每个时间步读入 z_t，输出 h_t；
+    LSTM 每个时间步读入 [z_t, a_t]，输出 h_t；
     再用一个线性层把 h_t 变成 K 个高斯分量的参数：
         pi_logits : (B, T, K)
         mu        : (B, T, K, D)
         sigma     : (B, T, K, D)
     """
 
-    def __init__(self, latent_dim=LATENT_DIM, hidden_size=HIDDEN_SIZE,
-                 num_mixtures=NUM_MIXTURES):
+    def __init__(self, latent_dim=LATENT_DIM, action_dim=3,
+                 hidden_size=HIDDEN_SIZE, num_mixtures=NUM_MIXTURES):
         super().__init__()
         self.latent_dim = latent_dim
+        self.action_dim = action_dim
         self.num_mixtures = num_mixtures
 
         self.lstm = nn.LSTM(
-            input_size=latent_dim,
+            input_size=latent_dim + action_dim,
             hidden_size=hidden_size,
             batch_first=True,
         )
@@ -218,30 +235,32 @@ class MDNRNN(nn.Module):
         output_size = num_mixtures * (1 + 2 * latent_dim)
         self.fc = nn.Linear(hidden_size, output_size)
 
-    def forward(self, z_sequence, hidden=None):
+    def forward(self, z_sequence, action_sequence, hidden=None):
         # z_sequence: (B, T, D)
-        #   B = 一次并行处理的序列条数（batch）
-        #   T = 每条序列的时间步数（sequence length）
-        #   D = latent z 的维度
-        lstm_out, hidden = self.lstm(z_sequence, hidden)  # (B, T, H)
-        params = self.fc(lstm_out)                        # (B, T, K*(1+2D))
+        # action_sequence: (B, T, A)
+        #   B = 一次并行处理的序列条数
+        #   T = 每条序列的时间步数
+        x = torch.cat([z_sequence, action_sequence], dim=-1)  # (B,T,D+A)
+
+        lstm_out, hidden = self.lstm(x, hidden)               # (B,T,H)
+        params = self.fc(lstm_out)                            # (B,T,K*(1+2D))
 
         batch_size, seq_len, _ = params.shape
         k = self.num_mixtures
         d = self.latent_dim
 
-        pi_logits = params[:, :, :k]                       # (B,T,K)
+        pi_logits = params[:, :, :k]                          # (B,T,K)
 
         mu_start = k
         mu_end = k + k * d
         mu = params[:, :, mu_start:mu_end]
-        mu = mu.reshape(batch_size, seq_len, k, d)         # (B,T,K,D)
+        mu = mu.reshape(batch_size, seq_len, k, d)            # (B,T,K,D)
 
         sigma_start = mu_end
         sigma_raw = params[:, :, sigma_start:]
         sigma_raw = sigma_raw.reshape(batch_size, seq_len, k, d)
         # softplus 保证 sigma > 0，比直接 exp 更稳定
-        sigma = F.softplus(sigma_raw) + 1e-4               # (B,T,K,D)
+        sigma = F.softplus(sigma_raw) + 1e-4                  # (B,T,K,D)
 
         return pi_logits, mu, sigma, hidden
 
@@ -283,26 +302,29 @@ def mixture_mean(pi_logits, mu):
     return (pi * mu).sum(dim=2)                # (B,T,D)
 
 
-def save_prediction(model, vae, sequences, index_sequences, images, device, path):
+def save_prediction(model, vae, z_sequences, action_sequences,
+                    index_sequences, images, device, path):
     """用一条验证序列做下一步预测，并保存真实帧 vs 预测帧。"""
     model.eval()
     vae.eval()
 
-    # 只取一条验证序列，输入 z_0..z_{T-1}
-    sequence = torch.from_numpy(sequences[0:1]).to(device)  # (1,T+1,D)
-    input_z = sequence[:, :-1]                              # (1,T,D)
-    target_z = sequence[:, 1:]                              # (1,T,D)
+    # 只取一条验证序列，输入 z_0..z_{T-1} 和 a_0..a_{T-1}
+    z_sequence = torch.from_numpy(z_sequences[0:1]).to(device)  # (1,T+1,D)
+    action_sequence = torch.from_numpy(action_sequences[0:1]).to(device)
+
+    input_z = z_sequence[:, :-1]                                # (1,T,D)
+    target_z = z_sequence[:, 1:]                                # (1,T,D)
 
     with torch.no_grad():
-        pi_logits, mu, _, _ = model(input_z)
-        predicted_z = mixture_mean(pi_logits, mu)           # (1,T,D)
+        pi_logits, mu, _, _ = model(input_z, action_sequence)
+        predicted_z = mixture_mean(pi_logits, mu)               # (1,T,D)
 
         # 预测的 z -> 解码器 -> 预测图像
-        predicted_images = vae.decoder(predicted_z[0])      # (T,3,64,64)
+        predicted_images = vae.decoder(predicted_z[0])          # (T,3,64,64)
 
     # 真实未来帧：原始图片（已经裁过 HUD、resize 到 64x64）
     frame_indices = index_sequences[0][1:]
-    actual_images = images[frame_indices]                   # (T,64,64,3)
+    actual_images = images[frame_indices]                       # (T,64,64,3)
 
     # 上排真实，下排预测
     top = np.concatenate(list(actual_images), axis=1)
@@ -332,46 +354,51 @@ def train(args):
 
     data_path = resolve_path(args.data)
     if not data_path.exists():
-        raise FileNotFoundError(f"找不到数据文件：{data_path}")
+        raise FileNotFoundError(
+            f"找不到数据文件：{data_path}\n"
+            "请先运行：python data_gen_rnn.py"
+        )
 
-    # 读取元数据：seed / step / gap
+    # 读取动作和 episode 信息
     with np.load(data_path) as data:
-        seeds = data["seeds"]
+        actions = data["actions"]
+        episode_ids = data["episode_ids"]
         steps = data["steps"]
-        gap = int(data["gap"])
 
     print(f"数据文件 : {data_path}")
-    print(f"数据间隔 : 每 {gap} 个环境步一帧")
-    if gap != 1:
-        print("注意     : 当前预测的是 gap 步之后，不是严格下一帧")
+    print(f"帧数     : {len(episode_ids)}")
+    print(f"局数     : {len(np.unique(episode_ids))}")
+    print(f"动作维度 : {actions.shape[1]}")
 
     images = load_images(data_path)
     vae = load_vae(args.vae_checkpoint, device)
     z = encode_images(vae, images, device)
 
-    # 用最后一个 seed 做验证，其他 seed 训练
-    val_seed = int(np.max(seeds))
-    train_mask = seeds != val_seed
-    val_mask = seeds == val_seed
+    # 用最后一局做验证，其他局训练
+    val_episode = int(np.max(episode_ids))
+    train_mask = episode_ids != val_episode
+    val_mask = episode_ids == val_episode
 
-    train_sequences, _ = build_sequences(
+    train_z, train_actions, _ = build_sequences(
         z[train_mask],
-        seeds[train_mask],
+        actions[train_mask],
+        episode_ids[train_mask],
         steps[train_mask],
         args.seq_len,
     )
-    val_sequences, val_indices = build_sequences(
+    val_z, val_actions, val_indices = build_sequences(
         z[val_mask],
-        seeds[val_mask],
+        actions[val_mask],
+        episode_ids[val_mask],
         steps[val_mask],
         args.seq_len,
     )
 
-    print(f"训练序列 : {train_sequences.shape}")
-    print(f"验证序列 : {val_sequences.shape}（held-out seed={val_seed}）")
+    print(f"训练序列 : {train_z.shape}")
+    print(f"验证序列 : {val_z.shape}（held-out episode={val_episode}）")
     print()
 
-    dataset = SequenceDataset(train_sequences)
+    dataset = SequenceDataset(train_z, train_actions)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -381,6 +408,7 @@ def train(args):
 
     model = MDNRNN(
         latent_dim=LATENT_DIM,
+        action_dim=actions.shape[1],
         hidden_size=args.hidden_size,
         num_mixtures=args.num_mixtures,
     ).to(device)
@@ -397,13 +425,14 @@ def train(args):
         model.train()
         total_loss = 0.0
 
-        for input_z, target_z in dataloader:
+        for input_z, input_actions, target_z in dataloader:
             input_z = input_z.to(device)
+            input_actions = input_actions.to(device)
             target_z = target_z.to(device)
 
             optimizer.zero_grad()
 
-            pi_logits, mu, sigma, _ = model(input_z)
+            pi_logits, mu, sigma, _ = model(input_z, input_actions)
             loss = mdn_loss(pi_logits, mu, sigma, target_z)
 
             loss.backward()
@@ -426,7 +455,8 @@ def train(args):
     save_prediction(
         model,
         vae,
-        val_sequences,
+        val_z,
+        val_actions,
         val_indices,
         images,
         device,
