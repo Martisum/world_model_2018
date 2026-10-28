@@ -57,8 +57,12 @@ def cma_es(f, x0, sigma0, maxiter=200, seed=0, verbose=True):
         sigma *= np.exp((cs / damps) * (np.linalg.norm(ps) / chi - 1))
 
         if verbose:
-            print(f"g={g:3d} m={np.round(m, 4)} sigma={sigma:.4f} "
-                  f"f(m)={f(m):.3e}")
+            if n <= 10:
+                print(f"g={g:3d} m={np.round(m, 4)} sigma={sigma:.4f} "
+                      f"f(m)={f(m):.3e}")
+            else:
+                # 高维控制器（例如 867 维）打印整个向量没有意义
+                print(f"g={g:3d} sigma={sigma:.4f} f(m)={f(m):.3e}")
 
     return m, sigma, C
 
