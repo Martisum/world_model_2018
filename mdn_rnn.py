@@ -316,6 +316,8 @@ def save_prediction(model, vae, z_sequences, action_sequences,
     target_z = z_sequence[:, 1:]                                # (1,T,D)
 
     with torch.no_grad():
+        # 注意：这里的 mu 是 MDN 输出头的分量均值 (1,T,K,D)，
+        # 不是 VAE 编码器的 mu (B,D)。
         pi_logits, mu, _, _ = model(input_z, action_sequence)
         predicted_z = mixture_mean(pi_logits, mu)               # (1,T,D)
 
